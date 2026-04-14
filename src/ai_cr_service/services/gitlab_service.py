@@ -57,14 +57,7 @@ class GitLabService:
         """
         Get changed files in a merge request.
 
-        Args:
-            project_id: GitLab project ID
-            mr_iid: Merge request IID
-            ignore_patterns: File patterns to ignore
-            ignore_extensions: File extensions to ignore
-
-        Returns:
-            List of GitLabDiffFile objects
+        Returns only diff content (no additional context), following industry best practices.
         """
         mr = self.get_merge_request(project_id, mr_iid)
         changes_data = mr.changes()
@@ -106,40 +99,25 @@ class GitLabService:
         ignore_extensions: List[str],
     ) -> bool:
         """Check if a file should be ignored based on patterns and extensions."""
-        # Check extension
         for ext in ignore_extensions:
             if file_path.endswith(ext):
                 return True
 
-        # Check patterns
         for pattern in ignore_patterns:
             if pattern.startswith("*."):
-                # Wildcard extension pattern
                 if file_path.endswith(pattern[1:]):
                     return True
             elif pattern.endswith("/"):
-                # Directory pattern
                 if f"/{pattern}" in f"/{file_path}" or file_path.startswith(pattern):
                     return True
             else:
-                # Exact match or contains
                 if pattern in file_path:
                     return True
 
         return False
 
     def create_mr_comment(self, project_id: int, mr_iid: int, body: str) -> dict:
-        """
-        Create a comment on a merge request.
-
-        Args:
-            project_id: GitLab project ID
-            mr_iid: Merge request IID
-            body: Comment body text
-
-        Returns:
-            Created comment data
-        """
+        """Create a comment on a merge request."""
         mr = self.get_merge_request(project_id, mr_iid)
         note = mr.notes.create({"body": body})
         logger.info(f"Created comment on MR {mr_iid}")
@@ -153,22 +131,9 @@ class GitLabService:
         file_path: str,
         line_number: int,
     ) -> dict:
-        """
-        Create a discussion (line comment) on a merge request.
-
-        Args:
-            project_id: GitLab project ID
-            mr_iid: Merge request IID
-            body: Comment body text
-            file_path: File path for the comment
-            line_number: Line number for the comment
-
-        Returns:
-            Created discussion data
-        """
+        """Create a discussion (line comment) on a merge request."""
         mr = self.get_merge_request(project_id, mr_iid)
 
-        # Get diff refs for position
         diff_refs = mr.diff_refs
         if not diff_refs:
             logger.warning(f"No diff refs found for MR {mr_iid}, creating regular comment")

@@ -2,49 +2,51 @@
 
 import json
 import logging
+import re
 from typing import List
 
 from openai import OpenAI
 
 from ..config import LLMProvider, Settings, get_settings
 from ..models.schemas import AICRResult, CRIssue, CRIssueLevel, GitLabDiffFile
+from .rule_service import get_rule_service
 
 logger = logging.getLogger(__name__)
 
 
-# Code review prompt template
-CR_PROMPT_TEMPLATE = """你是一个专业的代码评审工程师。请根据以下团队代码规范对代码进行评审：
+# Code review prompt template - 规范从 rule_service 动态加载
+CR_PROMPT_TEMPLATE = """请对以下代码进行评审。
 
-## 代码规范
-1. 代码风格：遵循对应语言的官方代码风格指南
-2. 命名规范：变量、函数、类使用有意义的名称
-3. 错误处理：正确处理异常和边界情况
-4. 安全性：避免常见安全漏洞（SQL注入、XSS、敏感信息泄露等）
-5. 性能：避免明显的性能问题
-6. 可维护性：代码清晰、模块化、易于理解
+{rules_section}
 
 ## 评审要求
 请将问题分为两类：
 - **bug**: 必须修复的问题（潜在的bug、安全漏洞、逻辑错误）
 - **suggestion**: 建议改进的问题（代码风格、可读性、性能优化）
 
+## 注意事项
+- 只评审新增或修改的代码（diff 中 + 开头的行）
+- 忽略删除的代码（diff 中 - 开头的行）
+- 行号应该是新文件中的行号
+
 ## 输出格式
 严格按照以下JSON格式输出，禁止返回自然语言：
 ```json
-{
+{{
   "total_issues": 数字,
   "issues": [
-    {
+    {{
       "file_path": "文件路径",
-      "line_number": 行号(估算),
+      "line_number": 行号,
       "level": "bug或suggestion",
       "title": "问题标题",
       "content": "问题描述和修改建议",
       "code_snippet": "问题代码片段"
-    }
+    }}
   ]
-}
+}}
 ```
+{context_section}
 
 ## 待评审代码
 {code_content}
@@ -52,12 +54,47 @@ CR_PROMPT_TEMPLATE = """你是一个专业的代码评审工程师。请根据�
 请开始评审："""
 
 
+def estimate_tokens(text: str) -> int:
+    """
+    Estimate token count for a text string.
+
+    Uses a simple heuristic:
+    - Chinese characters: ~2 tokens each
+    - English words: ~1.3 tokens per word
+    - Code/symbols: ~0.5 tokens per character
+    """
+    if not text:
+        return 0
+
+    chinese_chars = len(re.findall(r"[\u4e00-\u9fff]", text))
+    english_words = len(re.findall(r"[a-zA-Z]+", text))
+    remaining = len(text) - chinese_chars - sum(len(w) for w in re.findall(r"[a-zA-Z]+", text))
+
+    return int(chinese_chars * 2 + english_words * 1.3 + remaining * 0.5)
+
+
 class AIService:
     """Service for AI-powered code review."""
+
+    MODEL_CONTEXT_LIMITS = {
+        "gpt-4o": 128000,
+        "gpt-4o-mini": 128000,
+        "gpt-4-turbo": 128000,
+        "gpt-4": 8192,
+        "gpt-3.5-turbo": 16385,
+        "claude-3-opus": 200000,
+        "claude-3-sonnet": 200000,
+        "claude-3-haiku": 200000,
+    }
+
+    DEFAULT_CONTEXT_WINDOW = 32000
+    PROMPT_OVERHEAD = 2000  # 增加，因为规范内容更长
+    RESPONSE_BUFFER = 4000
 
     def __init__(self, settings: Settings | None = None):
         self.settings = settings or get_settings()
         self._client: OpenAI | None = None
+        self.rule_service = get_rule_service()
 
     @property
     def client(self) -> OpenAI:
@@ -69,39 +106,68 @@ class AIService:
                     base_url=self.settings.llm_base_url,
                 )
             else:
-                self._client = OpenAI(
-                    api_key=self.settings.llm_api_key,
-                )
+                self._client = OpenAI(api_key=self.settings.llm_api_key)
         return self._client
+
+    @property
+    def max_code_tokens(self) -> int:
+        """Get maximum tokens available for code content."""
+        context_limit = self.MODEL_CONTEXT_LIMITS.get(
+            self.settings.llm_model, self.DEFAULT_CONTEXT_WINDOW
+        )
+        return context_limit - self.PROMPT_OVERHEAD - self.RESPONSE_BUFFER
 
     def review_code(
         self,
         diff_files: List[GitLabDiffFile],
-        code_standards: str | None = None,
+        context: dict | None = None,
     ) -> AICRResult:
         """
         Perform AI code review on changed files.
 
-        Args:
-            diff_files: List of changed files with diffs
-            code_standards: Optional custom code standards
-
-        Returns:
-            AICRResult with issues found
+        Only sends diff content (with built-in context) to LLM.
+        Automatically splits large MRs into chunks if needed.
         """
         if not diff_files:
             return AICRResult(total_issues=0, issues=[])
 
-        # Build code content for review
-        code_content = self._build_code_content(diff_files)
+        # 检测语言并加载规范
+        file_paths = [f.new_path for f in diff_files]
+        languages = self.rule_service.detect_languages(file_paths)
+        rules_content = self.rule_service.get_rules_for_languages(languages)
+        logger.info(f"Loaded rules for languages: {languages}")
 
-        # Build prompt
-        prompt = CR_PROMPT_TEMPLATE.format(code_content=code_content)
-        if code_standards:
-            prompt = prompt.replace("## 代码规范\n1. 代码风格", f"## 代码规范\n{code_standards}\n\n1. 代码风格")
+        code_content = self._build_code_content(diff_files)
+        estimated_tokens = estimate_tokens(code_content)
+
+        logger.info(f"Estimated tokens: {estimated_tokens}, max allowed: {self.max_code_tokens}")
+
+        if estimated_tokens <= self.max_code_tokens:
+            return self._review_single(diff_files, rules_content, context)
+        else:
+            logger.info(f"Code too large ({estimated_tokens} tokens), splitting into chunks")
+            return self._review_chunked(diff_files, rules_content, context)
+
+    def _review_single(
+        self,
+        diff_files: List[GitLabDiffFile],
+        rules_content: str,
+        context: dict | None = None,
+    ) -> AICRResult:
+        """Review code in a single LLM call."""
+        code_content = self._build_code_content(diff_files)
+        context_section = self._build_context_section(context)
+
+        # 构建规范部分
+        rules_section = f"## 代码规范\n\n{rules_content}" if rules_content else ""
+
+        prompt = CR_PROMPT_TEMPLATE.format(
+            rules_section=rules_section,
+            code_content=code_content,
+            context_section=context_section,
+        )
 
         try:
-            # Call LLM
             response = self.client.chat.completions.create(
                 model=self.settings.llm_model,
                 messages=[
@@ -121,13 +187,106 @@ class AIService:
                 logger.warning("Empty response from LLM")
                 return AICRResult(total_issues=0, issues=[])
 
-            # Parse result
-            result = self._parse_result(result_text, diff_files)
-            return result
+            return self._parse_result(result_text, diff_files)
 
         except Exception as e:
             logger.error(f"Failed to call LLM: {e}")
             raise
+
+    def _build_context_section(self, context: dict | None) -> str:
+        """Build MR context section for prompt."""
+        if not context:
+            return ""
+
+        parts = []
+
+        mr_title = context.get("mr_title", "")
+        author = context.get("author", "")
+        source_branch = context.get("source_branch", "")
+        target_branch = context.get("target_branch", "")
+        mr_description = context.get("mr_description", "")
+
+        if mr_title:
+            parts.append(f"- 标题: {mr_title}")
+        if author:
+            parts.append(f"- 作者: {author}")
+        if source_branch and target_branch:
+            parts.append(f"- 分支: {source_branch} → {target_branch}")
+
+        if mr_description:
+            parts.append(f"\n### MR 描述\n{mr_description[:500]}")
+
+        if parts:
+            return "\n## MR 上下文\n" + "\n".join(parts)
+
+        return ""
+
+    def _review_chunked(
+        self,
+        diff_files: List[GitLabDiffFile],
+        rules_content: str,
+        context: dict | None = None,
+    ) -> AICRResult:
+        """Review large MR by splitting into chunks."""
+        chunks = self._split_into_chunks(diff_files)
+        logger.info(f"Split into {len(chunks)} chunks")
+
+        all_issues: List[CRIssue] = []
+
+        for i, chunk_files in enumerate(chunks):
+            logger.info(f"Reviewing chunk {i + 1}/{len(chunks)} ({len(chunk_files)} files)")
+
+            try:
+                result = self._review_single(chunk_files, rules_content, context)
+                all_issues.extend(result.issues)
+            except Exception as e:
+                logger.error(f"Failed to review chunk {i + 1}: {e}")
+                continue
+
+        unique_issues = self._deduplicate_issues(all_issues)
+
+        return AICRResult(total_issues=len(unique_issues), issues=unique_issues)
+
+    def _split_into_chunks(
+        self, diff_files: List[GitLabDiffFile]
+    ) -> List[List[GitLabDiffFile]]:
+        """Split files into chunks that fit within token limit."""
+        chunks: List[List[GitLabDiffFile]] = []
+        current_chunk: List[GitLabDiffFile] = []
+        current_tokens = 0
+
+        file_tokens = [(f, estimate_tokens(f.diff)) for f in diff_files]
+        file_tokens.sort(key=lambda x: x[1], reverse=True)
+
+        for file, tokens in file_tokens:
+            separator_tokens = 50
+
+            if current_tokens + tokens + separator_tokens > self.max_code_tokens:
+                if current_chunk:
+                    chunks.append(current_chunk)
+                current_chunk = [file]
+                current_tokens = tokens
+            else:
+                current_chunk.append(file)
+                current_tokens += tokens + separator_tokens
+
+        if current_chunk:
+            chunks.append(current_chunk)
+
+        return chunks
+
+    def _deduplicate_issues(self, issues: List[CRIssue]) -> List[CRIssue]:
+        """Remove duplicate issues."""
+        seen = set()
+        unique_issues = []
+
+        for issue in issues:
+            key = (issue.file_path, issue.line_number, issue.title)
+            if key not in seen:
+                seen.add(key)
+                unique_issues.append(issue)
+
+        return unique_issues
 
     def _build_code_content(self, diff_files: List[GitLabDiffFile]) -> str:
         """Build code content string from diff files."""
@@ -144,50 +303,54 @@ class AIService:
         return "\n\n---\n\n".join(parts)
 
     def _parse_result(
-        self,
-        result_text: str,
-        diff_files: List[GitLabDiffFile],
+        self, result_text: str, diff_files: List[GitLabDiffFile]
     ) -> AICRResult:
         """Parse LLM response into AICRResult."""
+        # 清理响应文本，移除可能的 markdown 代码块标记
+        if result_text.strip().startswith("```"):
+            lines = result_text.strip().split("\n")
+            if lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            result_text = "\n".join(lines)
+
         try:
             data = json.loads(result_text)
         except json.JSONDecodeError as e:
             logger.warning(f"Failed to parse LLM response as JSON: {e}")
+            logger.debug(f"Raw response: {result_text[:500]}")
             return AICRResult(total_issues=0, issues=[])
 
         issues = []
         file_paths = {f.new_path for f in diff_files}
 
         for issue_data in data.get("issues", []):
-            # Validate file path
             file_path = issue_data.get("file_path", "")
             if file_path not in file_paths:
-                # Try to find closest match
                 for fp in file_paths:
                     if file_path in fp or fp.endswith(file_path):
                         file_path = fp
                         break
 
-            # Parse level
             level_str = issue_data.get("level", "suggestion").lower()
             try:
                 level = CRIssueLevel(level_str)
             except ValueError:
                 level = CRIssueLevel.SUGGESTION
 
-            issues.append(CRIssue(
-                file_path=file_path,
-                line_number=issue_data.get("line_number", 1),
-                level=level,
-                title=issue_data.get("title", "Code issue"),
-                content=issue_data.get("content", ""),
-                code_snippet=issue_data.get("code_snippet"),
-            ))
+            issues.append(
+                CRIssue(
+                    file_path=file_path,
+                    line_number=issue_data.get("line_number", 1),
+                    level=level,
+                    title=issue_data.get("title", "Code issue"),
+                    content=issue_data.get("content", ""),
+                    code_snippet=issue_data.get("code_snippet"),
+                )
+            )
 
-        return AICRResult(
-            total_issues=len(issues),
-            issues=issues,
-        )
+        return AICRResult(total_issues=len(issues), issues=issues)
 
     def health_check(self) -> bool:
         """Check if LLM service is available."""

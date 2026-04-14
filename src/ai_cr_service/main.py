@@ -11,6 +11,7 @@ from .models.schemas import HealthResponse
 from .routers import cr_router
 from .services.ai_service import AIService
 from .services.cr_service import CRService
+import uvicorn
 
 # Configure logging
 logging.basicConfig(
@@ -75,7 +76,6 @@ def create_app() -> FastAPI:
         cr_service = getattr(app.state, "cr_service", None)
 
         llm_connected = False
-        redis_connected = False
 
         if cr_service:
             try:
@@ -83,17 +83,10 @@ def create_app() -> FastAPI:
             except Exception:
                 pass
 
-            try:
-                cr_service.redis_client.ping()
-                redis_connected = True
-            except Exception:
-                pass
-
         return HealthResponse(
             status="healthy" if llm_connected else "degraded",
             version="0.1.0",
             llm_connected=llm_connected,
-            redis_connected=redis_connected,
         )
 
     # Root endpoint
@@ -115,7 +108,6 @@ app = create_app()
 
 
 if __name__ == "__main__":
-    import uvicorn
 
     settings = get_settings()
     uvicorn.run(

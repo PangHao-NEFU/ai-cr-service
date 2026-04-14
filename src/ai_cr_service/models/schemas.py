@@ -76,4 +76,3 @@ class HealthResponse(BaseModel):
     status: str = "healthy"
     version: str
     llm_connected: bool
-    redis_connected: bool

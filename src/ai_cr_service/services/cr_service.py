@@ -1,14 +1,11 @@
 """Core Code Review service orchestrating GitLab and AI services."""
 
-import hashlib
-import json
 import logging
-from typing import List
 
-import redis
+# import redis  # TODO: Redis 暂时不启用，后续可能接入
 
 from ..config import Settings, get_settings
-from ..models.schemas import AICRResult, CRIssue, CRIssueLevel, GitLabDiffFile, MRTriggerRequest
+from ..models.schemas import AICRResult, CRIssue, CRIssueLevel, MRTriggerRequest
 from .ai_service import AIService
 from .gitlab_service import GitLabService
 
@@ -22,14 +19,14 @@ class CRService:
         self.settings = settings or get_settings()
         self.gitlab_service = GitLabService(self.settings)
         self.ai_service = AIService(self.settings)
-        self._redis_client: redis.Redis | None = None
+        # self._redis_client: redis.Redis | None = None  # TODO: Redis 暂不启用
 
-    @property
-    def redis_client(self) -> redis.Redis:
-        """Get or create Redis client."""
-        if self._redis_client is None:
-            self._redis_client = redis.from_url(self.settings.redis_url)
-        return self._redis_client
+    # @property
+    # def redis_client(self) -> redis.Redis:
+    #     """Get or create Redis client."""
+    #     if self._redis_client is None:
+    #         self._redis_client = redis.from_url(self.settings.redis_url)
+    #     return self._redis_client
 
     def perform_code_review(self, request: MRTriggerRequest) -> AICRResult:
         """
@@ -37,10 +34,9 @@ class CRService:
 
         This is the main entry point that orchestrates:
         1. Fetch MR changes from GitLab
-        2. Check cache for existing review
+        2. Get MR basic info (title, description)
         3. Call AI service for review
         4. Post comments to GitLab
-        5. Cache results
 
         Args:
             request: MR trigger request
@@ -50,7 +46,7 @@ class CRService:
         """
         logger.info(f"Starting code review for project {request.project_id}, MR {request.mr_iid}")
 
-        # 1. Get MR changes
+        # 1. Get MR changes (所有文件都会被CR)
         diff_files = self.gitlab_service.get_mr_changes(
             request.project_id,
             request.mr_iid,
@@ -62,17 +58,30 @@ class CRService:
             self._post_summary_comment(request, result, "No files to review")
             return result
 
-        # 2. Check cache
-        cache_key = self._get_cache_key(diff_files)
-        cached_result = self._get_cached_result(cache_key)
-        if cached_result:
-            logger.info("Using cached review result")
-            self._post_cr_comments(request, cached_result)
-            return cached_result
+        # 2. Get MR basic info
+        mr_info = self.gitlab_service.get_mr_info(request.project_id, request.mr_iid)
+        context = {
+            "mr_title": mr_info.get("title", ""),
+            "mr_description": mr_info.get("description", ""),
+            "source_branch": mr_info.get("source_branch", ""),
+            "target_branch": mr_info.get("target_branch", ""),
+            "author": mr_info.get("author", {}).get("username", "unknown"),
+        }
 
-        # 3. Perform AI review
+        # TODO: Redis 缓存暂不启用，后续可能接入
+        # cache_key = self._get_cache_key(diff_files, context.get("mr_title", ""))
+        # cached_result = self._get_cached_result(cache_key)
+        # if cached_result:
+        #     logger.info("Using cached review result")
+        #     self._post_cr_comments(request, cached_result)
+        #     return cached_result
+
+        # 3. Perform AI review (只传 diff，不获取额外上下文)
         try:
-            result = self.ai_service.review_code(diff_files)
+            result = self.ai_service.review_code(
+                diff_files=diff_files,
+                context=context,
+            )
             logger.info(f"AI review completed, found {result.total_issues} issues")
         except Exception as e:
             logger.error(f"AI review failed: {e}")
@@ -82,43 +91,44 @@ class CRService:
         # 4. Post comments to GitLab
         self._post_cr_comments(request, result)
 
-        # 5. Cache result
-        self._cache_result(cache_key, result)
+        # TODO: Redis 缓存暂不启用
+        # self._cache_result(cache_key, result)
 
         return result
 
-    def _get_cache_key(self, diff_files: List[GitLabDiffFile]) -> str:
-        """Generate cache key based on file contents."""
-        content = "".join(f"{f.new_path}:{f.diff}" for f in diff_files)
-        hash_value = hashlib.sha256(content.encode()).hexdigest()
-        return f"cr:cache:{hash_value}"
+    # TODO: Redis 缓存相关方法，后续可能接入
+    # def _get_cache_key(self, diff_files: List[GitLabDiffFile], mr_title: str = "") -> str:
+    #     """Generate cache key based on file contents and MR title."""
+    #     content = mr_title + "".join(f"{f.new_path}:{f.diff}" for f in diff_files)
+    #     hash_value = hashlib.sha256(content.encode()).hexdigest()
+    #     return f"cr:cache:{hash_value}"
 
-    def _get_cached_result(self, cache_key: str) -> AICRResult | None:
-        """Get cached review result if available."""
-        try:
-            cached = self.redis_client.get(cache_key)
-            if cached:
-                data = json.loads(cached)
-                issues = [CRIssue(**issue) for issue in data.get("issues", [])]
-                return AICRResult(total_issues=data.get("total_issues", 0), issues=issues)
-        except Exception as e:
-            logger.warning(f"Failed to get cache: {e}")
-        return None
+    # def _get_cached_result(self, cache_key: str) -> AICRResult | None:
+    #     """Get cached review result if available."""
+    #     try:
+    #         cached = self.redis_client.get(cache_key)
+    #         if cached:
+    #             data = json.loads(cached)
+    #             issues = [CRIssue(**issue) for issue in data.get("issues", [])]
+    #             return AICRResult(total_issues=data.get("total_issues", 0), issues=issues)
+    #     except Exception as e:
+    #         logger.warning(f"Failed to get cache: {e}")
+    #     return None
 
-    def _cache_result(self, cache_key: str, result: AICRResult) -> None:
-        """Cache review result."""
-        try:
-            data = {
-                "total_issues": result.total_issues,
-                "issues": [issue.model_dump() for issue in result.issues],
-            }
-            self.redis_client.setex(
-                cache_key,
-                self.settings.redis_cache_ttl,
-                json.dumps(data),
-            )
-        except Exception as e:
-            logger.warning(f"Failed to cache result: {e}")
+    # def _cache_result(self, cache_key: str, result: AICRResult) -> None:
+    #     """Cache review result."""
+    #     try:
+    #         data = {
+    #             "total_issues": result.total_issues,
+    #             "issues": [issue.model_dump() for issue in result.issues],
+    #         }
+    #         self.redis_client.setex(
+    #             cache_key,
+    #             self.settings.redis_cache_ttl,
+    #             json.dumps(data),
+    #         )
+    #     except Exception as e:
+    #         logger.warning(f"Failed to cache result: {e}")
 
     def _post_cr_comments(
         self,
