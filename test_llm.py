@@ -7,10 +7,14 @@
 """
 
 import os
+import requests
 from pathlib import Path
 
 from dotenv import load_dotenv
 from openai import OpenAI
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
 
 # 加载 .env 文件
 env_path = Path(__file__).parent / ".env"
@@ -20,13 +24,70 @@ load_dotenv(env_path)
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "")
 LLM_MODEL = os.getenv("LLM_MODEL", "")
-LLM_TEMPERATURE = os.getenv("LLM_TEMPERATURE", 0.1)
+LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.1"))
+
+
+def test_llm_with_requests():
+    """用 requests 直接测试大模型连接"""
+    print("=" * 50)
+    print("大模型连接测试 (requests)")
+    print("=" * 50)
+    print(f"Base URL: {LLM_BASE_URL}")
+    print(f"Model: {LLM_MODEL}")
+    print(f"API Key: {LLM_API_KEY[:10]}..." if LLM_API_KEY else "API Key 未设置!")
+    print("=" * 50)
+
+    if not LLM_API_KEY:
+        print("❌ 错误: LLM_API_KEY 未设置")
+        return False
+
+    # 构建完整的 API URL
+    api_url = LLM_BASE_URL.rstrip("/") + "/chat/completions"
+    print(f"\n请求 URL: {api_url}")
+
+    headers = {
+        "Authorization": f"Bearer {LLM_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "model": LLM_MODEL,
+        "messages": [
+            {"role": "user", "content": "who are you？what is your model name"}
+        ],
+        "temperature": LLM_TEMPERATURE,
+        "enable_thinking": False,
+    }
+
+    try:
+        print("\nrequest正在调用模型...")
+        response = requests.post(api_url, headers=headers, json=payload, timeout=60)
+
+        print(f"HTTP 状态码: {response.status_code}")
+
+        if response.status_code == 200:
+            data = response.json()
+            print("\n✅ request连接成功!")
+            print("-" * 50)
+            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            print(f"响应内容: {content}")
+            return True
+        else:
+            print(f"\n❌ request请求失败: {response.text}")
+            return False
+
+    except requests.exceptions.Timeout:
+        print("\n❌ request请求超时 (60秒)")
+        return False
+    except Exception as e:
+        print(f"\n❌ request连接失败: {e}")
+        return False
 
 
 def test_llm_connection():
-    """测试大模型连接"""
+    """测试大模型连接（使用 LangChain）"""
     print("=" * 50)
-    print("大模型连接测试")
+    print("大模型连接测试 (LangChain)")
     print("=" * 50)
     print(f"Base URL: {LLM_BASE_URL}")
     print(f"Model: {LLM_MODEL}")
@@ -38,58 +99,51 @@ def test_llm_connection():
         return False
 
     try:
-        client = OpenAI(
+        # 使用 LangChain ChatOpenAI
+        llm = ChatOpenAI(
+            model=LLM_MODEL,
             api_key=LLM_API_KEY,
             base_url=LLM_BASE_URL,
+            temperature=LLM_TEMPERATURE,
+            extra_body={"enable_thinking": False},
         )
 
         print("\n正在调用模型...")
-        response = client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=[
-                {"role": "system", "content": "你是一个有帮助的助手。"},
-                {"role": "user", "content": "请用一句话回答: 1+1等于几？"},
-            ],
-            temperature=LLM_TEMPERATURE,
-            max_tokens=100,
-        )
+
+        # 简单测试
+        response = llm.invoke("who are you")
 
         print("\n✅ 连接成功!")
         print("-" * 50)
-        print(f"响应内容: {response.choices[0].message.content}")
-        print(f"模型: {response.model}")
-        print(
-            f"Token 使用: prompt={response.usage.prompt_tokens}, completion={response.usage.completion_tokens}"
-        )
+        print(f"响应内容: {response.content}")
+        print(f"Token 使用: { response.usage_metadata }")
         return True
 
     except Exception as e:
-        print(f"\n❌ 连接失败: {e}")
+        print(f"\n❌ 连接失败: { e }")
         return False
 
 
 def test_cr_prompt():
-    """测试代码评审 Prompt"""
+    """测试代码评审 Prompt（使用 LangChain PromptTemplate）"""
     print("\n" + "=" * 50)
-    print("代码评审 Prompt 测试")
+    print("代码评审 Prompt 测试 (LangChain)")
     print("=" * 50)
 
-    test_code = """
-### File: src/main.py (NEW)
+    # 定义 Prompt 模板
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                "你是一个专业的代码评审工程师，擅长发现代码中的bug和改进点。你必须严格按照JSON格式输出。",
+            ),
+            (
+                "user",
+                """请对以下代码进行评审。
 
-```diff
-+def get_user(user_id):
-+    sql = f"SELECT * FROM users WHERE id = {user_id}"
-+    return db.execute(sql)
-```
-"""
-
-    prompt = f"""你是一个专业的代码评审工程师。请对以下代码进行评审。
-
-## 评审要求
-将问题分为两类：
-- **bug**: 必须修复的问题
-- **suggestion**: 建议改进的问题
+## 安全规范
+- 禁止硬编码密码、API Key、Token 等敏感信息
+- SQL 查询必须使用参数化，禁止字符串拼接
 
 ## 输出格式
 严格按照以下JSON格式输出：
@@ -109,34 +163,43 @@ def test_cr_prompt():
 ```
 
 ## 待评审代码
-{test_code}
+{code_content}
 
-请开始评审："""
+请开始评审：""",
+            ),
+        ]
+    )
+
+    test_code = """
+### File: src/main.py (NEW)
+
+```diff
++def get_user(user_id):
++    sql = f"SELECT * FROM users WHERE id = {user_id}"
++    return db.execute(sql)
+```
+"""
 
     try:
-        client = OpenAI(
+        # 创建 LLM
+        llm = ChatOpenAI(
+            model=LLM_MODEL,
             api_key=LLM_API_KEY,
             base_url=LLM_BASE_URL,
+            temperature=LLM_TEMPERATURE,
         )
 
+        # 创建链
+        chain = prompt | llm | StrOutputParser()
+
         print("正在调用模型进行代码评审...")
-        response = client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "你是一个专业的代码评审工程师，擅长发现代码中的bug和改进点。你必须严格按照JSON格式输出。",
-                },
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.1,
-            max_tokens=1000,
-            response_format={"type": "json_object"},
-        )
+
+        # 执行链
+        result = chain.invoke({"code_content": test_code})
 
         print("\n✅ 评审成功!")
         print("-" * 50)
-        print(f"评审结果:\n{response.choices[0].message.content}")
+        print(f"评审结果:\n{result}")
         return True
 
     except Exception as e:
@@ -144,10 +207,44 @@ def test_cr_prompt():
         return False
 
 
-if __name__ == "__main__":
-    # 测试基本连接
-    success = test_llm_connection()
+def test_prompt_template():
+    """测试 Prompt 模板管理功能"""
+    print("\n" + "=" * 50)
+    print("Prompt 模板管理测试")
+    print("=" * 50)
 
-    # 如果基本连接成功，测试 CR prompt
+    # 定义模板
+    template = ChatPromptTemplate.from_messages(
+        [
+            ("system", "你是 {role}。"),
+            ("user", "{task}"),
+        ]
+    )
+
+    # 演示模板变量
+    messages = template.format_messages(
+        role="专业的代码评审工程师", task="请评审这段代码: def hello(): pass"
+    )
+
+    print("\n生成的消息:")
+    for msg in messages:
+        print(f"  [{msg.type}]: {msg.content[:50]}...")
+
+    print("\n✅ Prompt 模板功能正常")
+    return True
+
+
+if __name__ == "__main__":
+    # 先用 requests 测试，更直观地看到问题
+    success = test_llm_with_requests()
+
+    # 如果 requests 成功，再用 LangChain 测试
     if success:
-        test_cr_prompt()
+        print("\n" + "=" * 50)
+        print("requests 测试成功，继续测试 LangChain...")
+        print("=" * 50)
+        if test_llm_connection():
+            test_cr_prompt()
+            test_prompt_template()
+    else:
+        print("requests 测试失败❎，检查网络或者baseurl")

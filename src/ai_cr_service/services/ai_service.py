@@ -1,11 +1,13 @@
-"""AI service for code review using LLM."""
+"""AI service for code review using LLM (LangChain version)."""
 
 import json
 import logging
 import re
 from typing import List
 
-from openai import OpenAI
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
 
 from ..config import LLMProvider, Settings, get_settings
 from ..models.schemas import AICRResult, CRIssue, CRIssueLevel, GitLabDiffFile
@@ -13,8 +15,10 @@ from .rule_service import get_rule_service
 
 logger = logging.getLogger(__name__)
 
+# System prompt
+SYSTEM_PROMPT = """你是一个专业的代码评审工程师，擅长发现代码中的bug和改进点。你必须严格按照JSON格式输出。"""
 
-# Code review prompt template - 规范从 rule_service 动态加载
+# Code review prompt template
 CR_PROMPT_TEMPLATE = """请对以下代码进行评审。
 
 {rules_section}
@@ -55,59 +59,54 @@ CR_PROMPT_TEMPLATE = """请对以下代码进行评审。
 
 
 def estimate_tokens(text: str) -> int:
-    """
-    Estimate token count for a text string.
-
-    Uses a simple heuristic:
-    - Chinese characters: ~2 tokens each
-    - English words: ~1.3 tokens per word
-    - Code/symbols: ~0.5 tokens per character
-    """
+    """Estimate token count for a text string."""
     if not text:
         return 0
 
     chinese_chars = len(re.findall(r"[\u4e00-\u9fff]", text))
     english_words = len(re.findall(r"[a-zA-Z]+", text))
-    remaining = len(text) - chinese_chars - sum(len(w) for w in re.findall(r"[a-zA-Z]+", text))
+    remaining = (
+        len(text) - chinese_chars - sum(len(w) for w in re.findall(r"[a-zA-Z]+", text))
+    )
 
     return int(chinese_chars * 2 + english_words * 1.3 + remaining * 0.5)
 
 
 class AIService:
-    """Service for AI-powered code review."""
+    """Service for AI-powered code review using LangChain."""
 
+    # 支持的模型上下文窗口大小
     MODEL_CONTEXT_LIMITS = {
-        "gpt-4o": 128000,
-        "gpt-4o-mini": 128000,
-        "gpt-4-turbo": 128000,
-        "gpt-4": 8192,
-        "gpt-3.5-turbo": 16385,
-        "claude-3-opus": 200000,
-        "claude-3-sonnet": 200000,
-        "claude-3-haiku": 200000,
+        "Qwen3-235B-A22B": 128000,
+        "deepseekv2": 128000,
     }
 
     DEFAULT_CONTEXT_WINDOW = 32000
-    PROMPT_OVERHEAD = 2000  # 增加，因为规范内容更长
+    PROMPT_OVERHEAD = 2000
     RESPONSE_BUFFER = 4000
 
     def __init__(self, settings: Settings | None = None):
         self.settings = settings or get_settings()
-        self._client: OpenAI | None = None
+        self._llm: ChatOpenAI | None = None
         self.rule_service = get_rule_service()
 
     @property
-    def client(self) -> OpenAI:
-        """Get or create OpenAI client."""
-        if self._client is None:
-            if self.settings.llm_provider == LLMProvider.CUSTOM and self.settings.llm_base_url:
-                self._client = OpenAI(
-                    api_key=self.settings.llm_api_key,
-                    base_url=self.settings.llm_base_url,
-                )
-            else:
-                self._client = OpenAI(api_key=self.settings.llm_api_key)
-        return self._client
+    def llm(self) -> ChatOpenAI:
+        """Get or create LangChain ChatOpenAI instance."""
+        if self._llm is None:
+            self._llm = ChatOpenAI(
+                model=self.settings.llm_model,
+                api_key=self.settings.llm_api_key,
+                base_url=(
+                    self.settings.llm_base_url
+                    if self.settings.llm_provider == LLMProvider.CUSTOM
+                    else None
+                ),
+                temperature=self.settings.llm_temperature,
+                max_tokens=self.settings.llm_max_tokens,
+                timeout=self.settings.llm_timeout,
+            )
+        return self._llm
 
     @property
     def max_code_tokens(self) -> int:
@@ -116,6 +115,15 @@ class AIService:
             self.settings.llm_model, self.DEFAULT_CONTEXT_WINDOW
         )
         return context_limit - self.PROMPT_OVERHEAD - self.RESPONSE_BUFFER
+
+    def _build_prompt(self) -> ChatPromptTemplate:
+        """Build the ChatPromptTemplate for code review."""
+        return ChatPromptTemplate.from_messages(
+            [
+                ("system", SYSTEM_PROMPT),
+                ("user", CR_PROMPT_TEMPLATE),
+            ]
+        )
 
     def review_code(
         self,
@@ -140,12 +148,16 @@ class AIService:
         code_content = self._build_code_content(diff_files)
         estimated_tokens = estimate_tokens(code_content)
 
-        logger.info(f"Estimated tokens: {estimated_tokens}, max allowed: {self.max_code_tokens}")
+        logger.info(
+            f"Estimated tokens: {estimated_tokens}, max allowed: {self.max_code_tokens}"
+        )
 
         if estimated_tokens <= self.max_code_tokens:
             return self._review_single(diff_files, rules_content, context)
         else:
-            logger.info(f"Code too large ({estimated_tokens} tokens), splitting into chunks")
+            logger.info(
+                f"Code too large ({estimated_tokens} tokens), splitting into chunks"
+            )
             return self._review_chunked(diff_files, rules_content, context)
 
     def _review_single(
@@ -154,35 +166,29 @@ class AIService:
         rules_content: str,
         context: dict | None = None,
     ) -> AICRResult:
-        """Review code in a single LLM call."""
+        """Review code in a single LLM call using LangChain."""
         code_content = self._build_code_content(diff_files)
         context_section = self._build_context_section(context)
 
         # 构建规范部分
         rules_section = f"## 代码规范\n\n{rules_content}" if rules_content else ""
 
-        prompt = CR_PROMPT_TEMPLATE.format(
-            rules_section=rules_section,
-            code_content=code_content,
-            context_section=context_section,
-        )
+        # 构建 prompt
+        prompt = self._build_prompt()
+
+        # 创建链
+        chain = prompt | self.llm | StrOutputParser()
 
         try:
-            response = self.client.chat.completions.create(
-                model=self.settings.llm_model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "你是一个专业的代码评审工程师，擅长发现代码中的bug和改进点。你必须严格按照JSON格式输出。",
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=self.settings.llm_temperature,
-                max_tokens=self.settings.llm_max_tokens,
-                response_format={"type": "json_object"},
+            # 执行链
+            result_text = chain.invoke(
+                {
+                    "rules_section": rules_section,
+                    "code_content": code_content,
+                    "context_section": context_section,
+                }
             )
 
-            result_text = response.choices[0].message.content
             if not result_text:
                 logger.warning("Empty response from LLM")
                 return AICRResult(total_issues=0, issues=[])
@@ -234,7 +240,9 @@ class AIService:
         all_issues: List[CRIssue] = []
 
         for i, chunk_files in enumerate(chunks):
-            logger.info(f"Reviewing chunk {i + 1}/{len(chunks)} ({len(chunk_files)} files)")
+            logger.info(
+                f"Reviewing chunk {i + 1}/{len(chunks)} ({len(chunk_files)} files)"
+            )
 
             try:
                 result = self._review_single(chunk_files, rules_content, context)
@@ -302,24 +310,49 @@ class AIService:
 
         return "\n\n---\n\n".join(parts)
 
+    def _extract_json_from_response(self, result_text: str) -> str | None:
+        """Extract JSON content from LLM response, filtering out thinking process."""
+        # 0. 移除 <think>...</think> 标签内容（某些模型会输出思考过程）
+        think_pattern = r"<think>.*?</think>"
+        result_text = re.sub(think_pattern, "", result_text, flags=re.DOTALL)
+
+        # 1. 尝试匹配 ```json ... ``` 代码块
+        json_block_pattern = r"```json\s*(.*?)\s*```"
+        match = re.search(json_block_pattern, result_text, re.DOTALL)
+        if match:
+            return match.group(1).strip()
+
+        # 2. 尝试匹配普通 ``` ... ``` 代码块
+        code_block_pattern = r"```\s*(.*?)\s*```"
+        match = re.search(code_block_pattern, result_text, re.DOTALL)
+        if match:
+            return match.group(1).strip()
+
+        # 3. 尝试从第一个 { 到最后一个 } 提取（用于没有代码块的情况）
+        json_start = result_text.find("{")
+        json_end = result_text.rfind("}")
+        if json_start != -1 and json_end != -1 and json_end > json_start:
+            return result_text[json_start : json_end + 1].strip()
+
+        return None
+
     def _parse_result(
         self, result_text: str, diff_files: List[GitLabDiffFile]
     ) -> AICRResult:
         """Parse LLM response into AICRResult."""
-        # 清理响应文本，移除可能的 markdown 代码块标记
-        if result_text.strip().startswith("```"):
-            lines = result_text.strip().split("\n")
-            if lines[0].startswith("```"):
-                lines = lines[1:]
-            if lines and lines[-1].strip() == "```":
-                lines = lines[:-1]
-            result_text = "\n".join(lines)
+        # 提取 JSON 内容（过滤 thinking 过程）
+        json_content = self._extract_json_from_response(result_text)
+
+        if not json_content:
+            logger.warning("Failed to extract JSON from LLM response")
+            logger.debug(f"Raw response: {result_text[:500]}")
+            return AICRResult(total_issues=0, issues=[])
 
         try:
-            data = json.loads(result_text)
+            data = json.loads(json_content)
         except json.JSONDecodeError as e:
             logger.warning(f"Failed to parse LLM response as JSON: {e}")
-            logger.debug(f"Raw response: {result_text[:500]}")
+            logger.debug(f"Extracted content: {json_content[:500]}")
             return AICRResult(total_issues=0, issues=[])
 
         issues = []
@@ -355,12 +388,8 @@ class AIService:
     def health_check(self) -> bool:
         """Check if LLM service is available."""
         try:
-            response = self.client.chat.completions.create(
-                model=self.settings.llm_model,
-                messages=[{"role": "user", "content": "Hello"}],
-                max_tokens=5,
-            )
-            return bool(response.choices)
+            response = self.llm.invoke("你是什么模型")
+            return bool(response.content)
         except Exception as e:
             logger.error(f"LLM health check failed: {e}")
             return False
